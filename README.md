@@ -26,9 +26,9 @@ Together these data suggest excess GWG among women with obesity in combination w
 	|- code/          # Script files used in analyses
 	|
 	|- results/       # all output from workflows and analyses
-  | |- compiled HTML version of analysis scripts 
+  	| |- compiled HTML version of analysis scripts 
 	| |- tables/      # Table results
 	| |- figures/     # graphs, likely designated for manuscript figures
 	|
-  |- executable/    # folder designated with all scripts and data
-                    # needed for reproducing results from .Rmd file
+  	|- executable/    # folder designated with all scripts and data
+	|                 # needed for reproducing results from .Rmd file
