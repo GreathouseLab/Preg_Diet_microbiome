@@ -1,0 +1,7 @@
+## Data folder information
+  
+    file information
+    |- data_DHQ_clean_HEI2010.csv     # cleaned dataset with HEI data
+    |- Micro_Diet_Mapping_NoDup.dta   # datafile maes microbiome data to subject data (see above file)
+    |- otu_table_rarefied.txt         # text file of OTU data
+    |- taxa_table.txt                 # OTU names
