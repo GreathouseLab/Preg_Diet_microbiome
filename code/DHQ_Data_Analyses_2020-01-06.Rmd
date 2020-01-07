@@ -1,0 +1,1468 @@
+---
+title: "Preg. Obese CFRIP Data Analyses"
+date: "2020-01-06"
+output: 
+  html_document: 
+    fig_caption: yes
+---
+
+
+## Packages and Setup
+
+```{r}
+options(width = 150)
+## General
+library(tidyverse)
+library(dplyr)
+library(effsize)
+library(lm.beta)
+## Graphing
+library(ggplot2)
+theme_set(theme_bw())
+## Tables
+library(kableExtra)
+## Reading in data
+library(readxl)
+library(haven)  ## for reading sas file
+## Microbiome functions
+library(phyloseq)
+
+## load up needed functions
+source("microbiome_statistics_and_functions.R")
+
+# Global options
+# cutoffs for microbiome views
+r.cut <- .5
+p.cut <- .05
+
+
+```
+
+# Read in Data and Fix Coding
+
+```{r}
+
+#cfrip_data <- read.table('FaucherMA_CFRIP_MappingFileTemplate_AlphaDiv_ASA24_DHQ_HEI_2019_04_02.csv', header=T, sep=",")
+cfrip_data <- haven::read_stata('Micro_Diet_Mapping_NoDup.dta')
+
+#cfrip_data$SubjectID <- cfrip_data$`SourceID(Subject ID)`
+
+## Fixing some variable codings
+# Next, check the normal vs. obese identifiers.
+unique(cfrip_data$BMI_Class)
+cfrip_data$BMI_Class[cfrip_data$BMI_Class == 1] <- 'Class 1'
+cfrip_data$BMI_Class[cfrip_data$BMI_Class == 2] <- 'Class 2-3'
+cfrip_data$BMI_Class[cfrip_data$BMI_Class == 3] <- 'Class 2-3'
+cfrip_data$BMI_Class[cfrip_data$BMI_Class == 0] <- 'Normal'
+cfrip_data$BMI_Class <- factor(cfrip_data$BMI_Class, levels = c("Normal", "Class 1", "Class 2-3"), ordered = T)
+unique(cfrip_data$BMI_Class)
+
+#Next, check on the GWG categories variable.
+#Also, make the name of this variable smaller...
+unique(cfrip_data$GWG_above_below_within_IOM)
+cfrip_data$GWG_Cat <- factor(
+  cfrip_data$GWG_above_below_within_IOM, levels = c(2,3,1),
+  labels = c('Below', 'Within', 'Above'), ordered = T
+) ## End factorizing this variable
+table(cfrip_data$GWG_Cat)
+##Fixing the missing values code for GWG total
+summary(cfrip_data$Total_GWG)
+cfrip_data$Total_GWG <- ifelse(cfrip_data$Total_GWG == 999, NA, cfrip_data$Total_GWG )
+summary(cfrip_data$Total_GWG)
+
+
+```
+
+
+```{r}
+## SAS Exported HEI scores
+#hei_scores <- read_sas('heistuff.sas7bdat')
+# HEI scores are in the last 26 variables (229:255)
+
+hei_scores <- readr::read_csv('data_DHQ_clean_HEI2010.csv')
+# HEI scores are in the last 26 variables (230:242)
+
+# need to map to timepoint 1
+d <- filter(cfrip_data, SampleSource == 'S-01')
+d <- d %>% arrange(desc(RespondentID))
+d$RespondentID <- as.character(d$RespondentID) 
+# save column names of d
+dnames <- colnames(d)
+hei_scores <- hei_scores %>% arrange(desc(RespondentID))
+j <- ncol(d)
+k <- ncol(hei_scores) ## number of columns to add to d
+d <- cbind(d, matrix(nrow=nrow(d), ncol=k))
+i <- 1
+for(i in 1:nrow(d)){
+  id <- d[i, 'RespondentID']
+  id <- str_sub(id, 1, 7)
+  print(id)
+  if(id == "") break
+  d[i, (j+1):(j+k)] <- hei_scores[ grep(id, hei_scores$RespondentID) , ]
+}
+
+colnames(d) <- c(dnames, colnames(hei_scores))
+hei_scores <- d ## resave as someone more easily recognizable
+
+
+## loop through names and make sure names are unique
+hei_scores <- repair_names(hei_scores)
+
+```
+
+Now I need to subset the CFRIP data that contains all the data into two subsets:
+
+  1. For the first time point 
+  2. For the second time point
+
+Once I have these two sets of data, I can create two dataset to run the exploratory analyses on.
+For each of these subsets, the data will need to be for the stool samples only.
+
+```{r}
+## subset to only Stool (S) and first timepoint (01)
+ffq_t1 <- filter(cfrip_data, SampleSource == 'S-01', RecallNo == 1 )
+## subset to only Stool (S) and second timepoint (02) 
+ffq_t2 <- filter(cfrip_data, SampleSource == "S-02", RecallNo == 2)
+
+```
+
+
+# Main Tasks to Complete
+
+  1. Table – Diet Quality (FFQ) Across Categories of Pre-pregnancy BMI status
+  2. Table - Diet Quality (FFQ) Across Categories of GWG among Women with BMI>=30
+  3. Heat Map - Correlation between nutrients (ASA24) and distal gut microbiota
+  4. Box Plots – Relative abundance of taxon by level of dietary variable, by category of GWG.
+ 
+Dietary factors:
+
+  1. HEI total (HEI2010_TOTAL_SCORE)
+  2. Total Veg (HEIX1_TOTALVEG)
+  3. Green beans (HEIX2_GREEN_AND_BEAN)
+  4. Total fruit (HEIX3_TOTALFRUIT)
+  5. Whole fruit (HEIX4_WHOLEFRUIT)
+  6. Whole grains (HEIX5_WHOLEGRAIN)
+  7. Dairy (HEIX6_TOTALDAIRY)
+  8. Total protein (HEIX7_TOTPROT)
+  9. Seafood (HEIX8_SEAPLANT_PROT)
+  10. Proteins (How is this different tha 8. ?)
+  11. Fatty Acids (HEIX9_FATTYACID)
+  12. Sodium (HEIX10_SODIUM)
+  13. Refined Grains (HEIX11_REFINEDGRAIN)
+  14. SOFAAS (HEIX12_SOFAAS)
+
+## Analyses to for tasks 1-2
+
+Need to run ANOVAs for 
+
+  1. BMI Class (Normal, Class I, Class II/III)
+	2. GWG Categories (below , within, above)
+
+In the output, there will be the Total mean of the dietary factor, the mean by the three categories, the F-statistic, P-value, \(\omega^2, \eta^2\).
+For each mean, I will include the SE (for +/-).
+
+## Analyses for task 3 
+
+Screening for BMI/GWG correlations with gut microbiome.\\
+
+For these analyses, I have two major sets of analyses. 
+First, is by Food Frequency Questionnaires (FFQ) (Slide 16, Step 1A: FFQ/DHQII)
+
+  1. Create matrix of gut microbiome and dietary variables from FFQ (DHQII)
+  2. Remove all taxa (genus) that have <2\% relative abundance in any sample of the gut microbiome
+  3. For each taxon identify the median by sample time point
+  4. For each measure of alpha diversity identify the median by time point
+  5. For each dietary (all listed) variable
+      
+      i. Conduct 2-tailed t-test on dietary variables above vs below the median of each taxon
+      ii. Conduct spearman correlation between dietary variables and taxon
+      iii.  Conduct 2-tailed t-test on dietary variables above vs below the median of each measure of alpha diversity
+      iv.  Conduct spearman correlation between dietary variables and each measure of alpha diversity
+  6. List all t-test results that have p<0.1 AND correlation R2 >0.5
+  7. Make heat map of the spearman correlation results meeting the above criteria colored by strength of correlation and *’d if p<0.05 (see example) 
+
+Second, is by ASA24 survey of food.
+  
+  1. Create matrix of gut microbiome and dietary variables matched by time point (i.e. gut sample 1 AND ASA24 RecallNo 1)
+  2. Remove all taxa (genus) that have <2\% relative abundance in any sample of the gut microbiome
+  3. For each taxon identify the median by sample time point
+  4. For each measure of alpha diversity identify the median by time point
+  5. For each dietary (all listed) variable
+      
+      i. Conduct 2-tailed t-test on dietary variables above vs below the median of each taxon
+      ii. Conduct spearman correlation between dietary variables and taxon
+      iii.  Conduct 2-tailed t-test on dietary variables above vs below the median of each measure of alpha diversity
+      iv.  Conduct spearman correlation between dietary variables and each measure of alpha diversity
+      
+  6. List all t-test results that have p<0.1 AND correlation R2 >0.5
+  7. Make heat map of the spearman correlation results meeting the above criteria colored by strength of correlation and satrred’d if p<0.05 (see example) 
+
+# ANOVA Analyses
+
+First, I need to create the function that will be used across the Dietary factors and sets of data.
+
+```{r}
+## STandard error calc.
+se <- function(x, na.rm=FALSE) {
+  if (na.rm) x <- na.omit(x)
+  sqrt(var(x)/length(x))
+}
+
+## Estimating omega**2
+o2 <- function(ss, sst, df, mse){
+  (ss - df*mse)/(sst + mse)
+}
+omega2 <- function(fit.sum){
+  fit.sum <- fit.sum[[1]]
+  k <- nrow(fit.sum) - 1
+  ms_error <- fit.sum$`Mean Sq`[k+1]
+  p.omega <- matrix(NA,ncol=1,nrow=(k))
+  dfs <- fit.sum$Df
+  sss <- fit.sum$`Sum Sq`
+  SST <- sum(fit.sum$`Sum Sq`)
+  for(i in 1:(k))
+  {
+    p.omega[i,] <- round(o2(sss[i], SST, dfs[i], ms_error),4)
+  }
+  rownames(p.omega) <- rownames(fit.sum)[1:(k)]
+  colnames(p.omega) <- "omega2"
+  return(p.omega)
+}
+
+# Estimating eta**2 (r**2)
+e2 <- function(ss,sst){
+  (ss)/(sst)
+}
+eta2 <- function(fit.sum){
+  fit.sum <- fit.sum[[1]]
+  k <- nrow(fit.sum) - 1
+  eta <- matrix(NA,ncol=1,nrow=(k))
+  sss <- fit.sum$`Sum Sq`
+  SST <- sum(sss)
+  for(i in 1:(k))
+  {
+    eta[i,] <- round(e2(sss[i],SST),4)
+  }
+  rownames(eta) <- rownames(fit.sum)[1:(k)]
+  colnames(eta) <- "eta2"
+  return(eta)
+}
+
+
+anova_assumptions_check <- function(dat, outcome, factors, stats = NULL){
+  cat('\n ============================= \n')
+  cat('\n Tests and Plots of Normality:\n')
+  # Assess normality
+  aov.out = aov(
+    as.formula(paste(outcome, '~',
+               paste(factors,collapse = "*"))), 
+    data = dat)
+  #par(mfrow = c(2, 2))
+  plot(aov.out)
+  #dev.off()
+  # shapiro-wilks test
+  if(length(aov.out$residuals) > 5000){ 
+    res <- sample(aov.out$residuals, 5000)
+  } else res <- aov.out$residuals
+  cat('\n Shapiro-Wilks Test of Normality of Residuals:\n')
+  print(shapiro.test(res))
+  # K-S Test 
+  cat('\n K-S Test for Normality of Residuals:\n')
+  print(ks.test(aov.out$residuals, 'pnorm', 
+          alternative = 'two.sided'))
+  cat('\n')
+
+  # boxplots
+  print(
+    ggplot(dat, 
+           aes_string(
+             y=outcome,x=factors[1],
+             color = factors[1])
+           ) +
+      geom_boxplot(outlier.alpha=0) +
+      geom_point(position = 'jitter') +
+      labs(title = paste(outcome, 'distribution by', factors[1])) +
+      scale_color_brewer(palette="Dark2") +
+      theme_bw()
+  ) ## End Print
+  
+  cat('\n ============================= \n')
+  cat('\n Tests of Homogeneity of Variance\n')
+  # Varainces
+  cat('\n \n Levenes Test: ', factors[1], '\n \n \n')
+  print(
+    car::leveneTest(
+      as.formula(paste(outcome, '~',factors[1])),
+             data = dat,
+             center="mean")
+  ) ## End Print
+}
+
+## ffq_anova: function to run anovas for ffq variables
+# data = dataset that contains all the variables needed
+# v.n = variable.name of the outcome (dietary factor) of interest
+# gorup = grouping variable for ANOVA
+ffq_anova <- function(data, v.n, group){
+  # data <- ffq_t1
+  # v.n <- "HEI2010_TOTAL_SCORE"
+  # group <- 'BMI_Class'
+  
+  if(anyNA(data[,group])){
+    cat('\nOne or more cases were removed due to missing value on the grouping variable.\n\n')
+    data <- data[is.na(data[,group]) == F, ]
+  }
+  
+  
+  out <- numeric()
+  ## First calculate summary statistics
+  m <- numeric(2)
+  m[1] <- mean(data[,v.n, drop=T], na.rm = T) ## mean
+  m[2] <- se(data[,v.n, drop=T], na.rm = T) ## se
+  names(m) <- c('Total', 'SE Total')
+  
+  ## Start to get the by group means
+  summ <- paste0('mean(', v.n, ', na.rm=T)')  # construct summary method, e.g. mean(mpg)
+  summ.name <- paste0('mean_', v.n)  # construct summary variable name, e.g. mean_mpg
+  ## Calc summary stats by group.
+  m.g <- data %>%
+    group_by_(group) %>%
+    summarise_(.dots = setNames(summ, summ.name))
+  mg <- m.g[,2, drop = T]
+  names(mg) <- m.g[,1, drop = T]
+  
+  summ <- paste0('se(', v.n, ', na.rm=T)')  # construct summary method, e.g. mean(mpg)
+  summ.name <- paste0('se_', v.n)  # construct summary variable name, e.g. mean_mpg
+  ## Calc summary stats by group.
+  mse.g <- data %>%
+    group_by_(group) %>%
+    summarise_(.dots = setNames(summ, summ.name))
+  mseg <- mse.g[,2, drop = T]
+  names(mseg) <- paste0('SE ',mse.g[,1, drop = T])
+  # reorder mg and mseg so that they line up
+  i <- j <- 1
+  k <- length(mg)
+  mg.out <- n <- numeric(k*2)
+  while(i <= k){
+    mg.out[j] <- mg[i]
+      n[j] <- names(mg)[i]
+    mg.out[j+1] <- mseg[i]
+      n[j+1] <- names(mseg)[i]
+    i <- i +1
+    j <- j + 2
+  }
+  names(mg.out) <- n
+  ## Now run one-way ANOVA Assumption check
+  anova_assumptions_check(data, v.n, group)
+  
+  ## Run One-Way ANOVA
+  f.out <- numeric(5)
+  aov.sum <- summary(aov(as.formula(paste0(v.n, "~", group)), data = data))
+  f.out[1:2] <- aov.sum[[1]]$Df
+  f.out[3] <- aov.sum[[1]]$`F value`[1]
+  f.out[4] <- aov.sum[[1]]$`Pr(>F)`[1]
+  o.out <- omega2(aov.sum)
+  f.out[5] <- ifelse(o.out < 0, 0, o.out)
+  f.out[6] <- eta2(aov.sum)
+  names(f.out) <- c('df Effect', 'df Error', "f-value", "p-value", 'omega2', 'eta2')
+  
+  
+  ## Output matrix
+  out <- c(m, mg.out, f.out)
+  return(out)
+}
+
+```
+
+## Running ANOVAs for Previously calc. HEI Scores
+
+### Time Point 1:RecallNum 1 - BMI Categories
+
+```{r  warning=FALSE}
+
+metrics <- c('HEI2010_TOTAL_SCORE', 'HEIX1_TOTALVEG', 'HEIX2_GREEN_AND_BEAN', 'HEIX3_TOTALFRUIT', 'HEIX4_WHOLEFRUIT', 'HEIX5_WHOLEGRAIN', 'HEIX6_TOTALDAIRY', 'HEIX7_TOTPROT', 'HEIX8_SEAPLANT_PROT', 'HEIX9_FATTYACID', 'HEIX10_SODIUM', 'HEIX11_REFINEDGRAIN', 'HEIX12_SOFAAS')
+
+
+group.var <- c('BMI_Class', 'GWG_Cat')
+
+## Data Subset
+## subset to only Stool (S) and first timepoint (01)
+ffq_t1 <- filter(cfrip_data, SampleSource == 'S-01', RecallNo == 1 )
+
+
+## Initialize results matrix
+results.bmi <- as.data.frame(matrix(NA, nrow=length(metrics), ncol=15))
+
+iter<- 1
+for(met in metrics){
+  results.bmi[iter,1] <- met
+  res.out <- ffq_anova(data=ffq_t1, v.n=met, group= group.var[1])
+  results.bmi[iter,2:15] <- res.out
+  
+  iter <- iter + 1
+}
+
+colnames(results.bmi) <- c('Dietary Factor', names(res.out))
+##Print out summary table
+kable(results.bmi, format = 'html', digits=3) %>%
+  kable_styling(full_width = T)
+
+ffq_t1 %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+  
+```
+
+### Time Point 2:RecallNum 2 - BMI Categories
+
+```{r warning=FALSE}
+
+## Data
+## subset to only Stool (S) and second timepoint (02) 
+ffq_t2 <- filter(cfrip_data, SampleSource == "S-02", RecallNo == 2)
+
+## Initize reults matrix
+results.bmi <- as.data.frame(matrix(NA, nrow=length(metrics), ncol=15))
+
+iter<- 1
+for(met in metrics){
+  results.bmi[iter,1] <- met
+  res.out <- ffq_anova(data=ffq_t2, v.n=met, group= group.var[1])
+  results.bmi[iter,2:15] <- res.out
+  
+  iter <- iter + 1
+}
+
+colnames(results.bmi) <- c('Dietary Factor', names(res.out))
+##Print out summary table
+kable(results.bmi, format = 'html', digits=3) %>%
+  kable_styling(full_width = T)
+
+ffq_t2 %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+  
+```
+
+### Time Point 1:RecallNum 1 - GWG Categories ANOVA for women with pre-preg BMI >= 30
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+results.gwg <- as.data.frame(matrix(NA, nrow=length(metrics), ncol=15))
+
+## Subset to BMI>30
+ffq_t1.bmi30p <- filter(ffq_t1, PrePreg_BMI >=30)
+
+
+iter<- 1
+for(met in metrics){
+  results.gwg[iter,1] <- met
+  res.out <- ffq_anova(data=ffq_t1.bmi30p, v.n=met, group= group.var[2])
+  k <- length(res.out)
+  #if(k != 14) 
+  results.gwg[iter,2:15] <- res.out
+  iter <- iter + 1
+}
+colnames(results.gwg) <- c('Dietary Factor', names(res.out))
+##Print out summary table
+kable(results.gwg, format = 'html', digits=3) %>%
+  kable_styling(full_width = T)
+
+ffq_t1.bmi30p  %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+```
+
+### Time Point 2:RecallNum 2 - GWG Categories ANOVA for women with pre-preg BMI >= 30
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+results.gwg <- as.data.frame(matrix(NA, nrow=length(metrics), ncol=15))
+
+## Subset to BMI>30
+ffq_t2.bmi30p <- filter(ffq_t2, PrePreg_BMI >=30)
+
+
+iter<- 1
+for(met in metrics){
+  results.gwg[iter,1] <- met
+  res.out <- ffq_anova(data=ffq_t2.bmi30p, v.n=met, group= group.var[2])
+  results.gwg[iter,2:15] <- res.out
+  
+  iter <- iter + 1
+}
+colnames(results.gwg) <- c('Dietary Factor', names(res.out))
+##Print out summary table
+kable(results.gwg, format = 'html', digits=3) %>%
+  kable_styling(full_width = T)
+
+ffq_t2.bmi30p  %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+```
+
+## Analyses with Newly Created HEI Scores
+
+  1. HEI total (HEI2015_TOTAL_SCORE)
+  2. Total Veg (HEI2015C1_TOTALVEG)
+  3. Green beans (HEIX2_GREEN_AND_BEAN)
+  4. Total fruit (HEI2015C3_TOTALFRUIT)
+  5. Whole fruit (HEI2015C4_WHOLEFRUIT)
+  6. Whole grains (HEI2015C5_WHOLEGRAIN)
+  7. Dairy (HEI2015C6_TOTALDAIRY)
+  8. Total protein (HEI2015C7_TOTPROT)
+  9. Seafood (HEI2015C8_SEAPLANT_PROT)
+  10. Fatty Acids (HEI2015C9_FATTYACID)
+  11. Sodium (HEI2015C10_SODIUM)
+  12. Refined Grains (HEI2015C11_REFINEDGRAIN)
+  13. Saturated Fat (HEI2015C12_SFAT)
+  14. Added Sugars (HEI2015C13_ADDSUG)
+
+### BMI Categories vs New HEI Scores
+
+```{r}
+
+#metrics <- c('HEI2015_TOTAL_SCORE','HEI2015C1_TOTALVEG','HEIX2_GREEN_AND_BEAN','HEI2015C3_TOTALFRUIT','HEI2015C4_WHOLEFRUIT','HEI2015C5_WHOLEGRAIN','HEI2015C6_TOTALDAIRY','HEI2015C7_TOTPROT','HEI2015C8_SEAPLANT_PROT','HEI2015C9_FATTYACID','HEI2015C10_SODIUM','HEI2015C11_REFINEDGRAIN','HEI2015C12_SFAT','HEI2015C13_ADDSUG')
+
+
+metrics <- c("heix1_totalveg",                    "heix2_greens_and_bean", "heix3_totalfruit" ,           "heix4_wholefruit",             "heix5_wholegrain",                  "heix6_totaldairy" ,                
+"heix7_totprot" ,                    "heix8_seaplant_prot",              
+"heix9_fattyacid",                   "heix10_sodium",                    
+"heix11_refinedgrain",               "heix12_sofaas","hei2010_total_score")
+
+group.var <- c('BMI_Class', 'GWG_Cat')
+results.bmi <- as.data.frame(matrix(NA, nrow=length(metrics), ncol=15))
+
+iter<- 1
+for(met in metrics){
+  results.bmi[iter,1] <- met
+  res.out <- ffq_anova(data=hei_scores, v.n=met, group= group.var[1])
+  results.bmi[iter,2:15] <- res.out
+  
+  iter <- iter + 1
+}
+
+colnames(results.bmi) <- c('Dietary Factor', names(res.out))
+##Print out summary table
+kable(results.bmi, format = 'html', digits=3) %>%
+  kable_styling(full_width = T)
+
+hei_scores %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+
+```
+
+### GWG Categories ANOVA for women with pre-preg BMI >= 30
+
+```{r}
+
+results.gwg <- as.data.frame(matrix(NA, nrow=length(metrics), ncol=15))
+
+hei_scores.bmi30p <- filter(hei_scores, PrePreg_BMI >=30)
+iter<- 1
+for(met in metrics){
+  results.gwg[iter,1] <- met
+  res.out <- ffq_anova(data=hei_scores.bmi30p, v.n=met, group= group.var[2])
+  results.gwg[iter,2:15] <- res.out
+  
+  iter <- iter + 1
+}
+colnames(results.gwg) <- c('Dietary Factor', names(res.out))
+##Print out summary table
+kable(results.gwg, format = 'html', digits=3) %>%
+  kable_styling(full_width = T)
+
+hei_scores.bmi30p %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+```
+
+# Mapping data for Microbiome Analyses
+
+First I need to wrestle with the microbiome data to connect those data with the diet data... here we go.
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+# OTU Data
+otu_table_dat <- read.table("otu_table_rarefied.txt", sep = "\t", header = T)
+rownames(otu_table_dat) <- otu_table_dat$X
+otu_table_mydata <- as.matrix(otu_table_dat[,2:111])
+OTU <- otu_table(otu_table_mydata, taxa_are_rows = T, errorIfNULL = F)
+
+# Taxonomy Data
+taxa_table_dat <- read.table("taxa_table.txt", sep = "\t", header = T)
+rownames(taxa_table_dat) <- taxa_table_dat$X
+taxa_table_dat <- as.matrix(taxa_table_dat[,2:7])
+TAX <- tax_table(taxa_table_dat)
+
+# # Make Phylogenic Tree
+# taxa_table_dat <- read.table("taxa_table.txt", sep = "\t", header = T)
+# taxa_table_dat$Kingdom <- as.factor(taxa_table_dat$Kingdom)
+# taxa_table_dat$Phylum <- as.factor(taxa_table_dat$Phylum)
+# taxa_table_dat$Class <- as.factor(taxa_table_dat$Class)
+# taxa_table_dat$Order <- as.factor(taxa_table_dat$Order)
+# taxa_table_dat$Family <- as.factor(taxa_table_dat$Family)
+# taxa_table_dat$Genus <- as.factor(taxa_table_dat$Genus)
+# 
+# dat_tree <- as.phylo(~Phylum/Class/Order/Family/Genus, data = taxa_table_dat, use.labels = T)
+# dat_tree$tip.label <- taxa_names(TAX)
+
+
+## Use the above data as the sampledata
+samp.names <- colnames(otu_table_mydata)
+subdat <- cfrip_data[ cfrip_data$SampleID %in% samp.names,]
+subdat <- as.data.frame(subdat)
+rownames(subdat) <- subdat$SampleID
+samdat <- sample_data(subdat)
+
+
+# Combine the data
+preg_microbiome_dat <- phyloseq(OTU, TAX, samdat)
+preg_microbiome_dat
+
+
+# Now prepare data for Jun's Code:
+# Start to get the file in the Jun Chen format
+otus <- psmelt(preg_microbiome_dat)
+otus <- otus[ otus$Sample %in% subdat$SampleID, ]
+k <- ncol(otus)
+otus <- otus[,c(1:3,(k-5):k)]
+otus2 <- reshape(otus, idvar = "OTU", timevar = "Sample", direction = "wide")
+OTU <- otus2$OTU
+Kingdom <- otus2$Kingdom.Faucher.0008459
+Phylum <- otus2$Phylum.Faucher.0008459
+Class <- otus2$Class.Faucher.0008459
+Order <- otus2$Order.Faucher.0008459
+Family <- otus2$Family.Faucher.0008459
+Genus <- otus2$Genus.Faucher.0008459
+# Next get just the observed counts of the OTUs
+observed_counts <- otus2[, grep("Abundance",colnames(otus2)) ]
+i <- 1
+for(i in 1:length(colnames(observed_counts))){
+  colnames(observed_counts)[i] <- substring(colnames(observed_counts)[i], 11)
+}
+
+# OTU Names object
+otu.name <- cbind(Kingdom,Phylum,Class,Order,Family,Genus)
+rownames(otu.name) <- OTU
+
+# Abundance List Objects
+abund.list <- list( cbind(Kingdom,observed_counts),
+                    cbind(Phylum,observed_counts),
+                    cbind(Class,observed_counts),
+                    cbind(Order,observed_counts),
+                    cbind(Family,observed_counts),
+                    cbind(Genus,observed_counts),
+                    cbind(OTU,observed_counts))
+names(abund.list) <- c("Kingdom","Phylum","Class","Order","Family","Genus","OTU")
+i <- 1
+for(i in 1:7){
+  abund.list[[i]] <- abundance_list_create(abund.list[[i]],abund.list[[i]][,1])
+}
+abund.list_saved <- abund.list
+# Full dataset ready for Jun's Code:
+preg_mircobiome_data <- list(otu.tab <- abund.list$OTU,
+                              otu.name, abund.list,
+                              meta.dat <- subdat)
+names(preg_mircobiome_data) <- c("otu.tab", "otu.name","abund.list",
+                                  "meta.dat")
+
+### Now that we know which genera to use, 
+# we can reshape the raw abundance data to be 
+# merged with the meta-data for creating the heatmaps.
+# So, the following reshapes the microbiome data.
+## Now, merge the genera data with the meta data.
+# first, make the first letters genera:(whatever thegenera is).
+rownames(abund.list$Genus) <- paste0('Genus_',rownames(abund.list$Genus))
+g.dat <- as.data.frame(t(abund.list$Genus))
+g.dat$merged_IDs <- rownames(g.dat)
+g.dat <- g.dat %>% arrange(desc(merged_IDs))
+subdat <- subdat %>% arrange(desc(SampleID))
+
+## Merged correctly!!!!!
+cfrip_data_biom <- cbind(subdat, g.dat)
+# therefore, this is the data that I can use for the remaining analyses.
+
+```
+
+Now, I need to identify the genera with greater than 2\% relative abundance across all cases by timepoint and sample source.
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+## Now, identify the genera with abundance greater than 2%
+genera_dat <- as.data.frame(matrix(ncol=3))
+colnames(genera_dat) <- c('SampleSource', 'Genus', 'RelAbund')
+
+## Set up loops
+ITER <- c('S-01', 'S-02')
+
+for(iter in ITER){
+    # Subset to necessary Samples
+    subdat.mi <- subset_samples(preg_microbiome_dat, SampleSource==iter)
+    meta.sub <- subdat[subdat$SampleSource==iter, ]
+
+    # Now prepare data for Jun's Code:
+    # Start to get the file in the Jun Chen format
+    otus.s <- psmelt(subdat.mi)
+    otus.s <- otus.s[ otus.s$Sample %in% meta.sub$SampleID, ]
+    k <- ncol(otus.s)
+    otus.s <- otus.s[,c(1:3,(k-5):k)]
+    otus2 <- reshape(otus.s, idvar = "OTU", timevar = "Sample", direction = "wide")
+    OTU <- otus2$OTU
+    Kingdom <- otus2[,3]
+    Phylum <- otus2[,4]
+    Class <- otus2[,5]
+    Order <- otus2[,6]
+    Family <- otus2[,7]
+    Genus <- otus2[,8]
+    
+    # Next get just the observed counts of the OTUs
+    observed_counts <- otus2[, grep("Abundance",colnames(otus2)) ]
+    i <- 1
+    for(i in 1:length(colnames(observed_counts))){
+      colnames(observed_counts)[i] <- substring(colnames(observed_counts)[i], 11)
+    }
+    
+    # OTU Names object
+    otu.name <- cbind(Kingdom,Phylum,Class,Order,Family,Genus)
+    rownames(otu.name) <- OTU
+    
+    # Abundance List Objects
+    abund.list <- list( cbind(Kingdom,observed_counts),
+                        cbind(Phylum,observed_counts),
+                        cbind(Class,observed_counts),
+                        cbind(Order,observed_counts),
+                        cbind(Family,observed_counts),
+                        cbind(Genus,observed_counts),
+                        cbind(OTU,observed_counts))
+    names(abund.list) <- c("Kingdom","Phylum","Class","Order","Family","Genus","OTU")
+    i <- 1
+    for(i in 1:7){
+      abund.list[[i]] <- abundance_list_create(abund.list[[i]],abund.list[[i]][,1])
+    }
+    
+    meta.sub  <- meta.sub[ meta.sub$SampleID %in% colnames(abund.list$Genus), ]
+    
+    # Calculate Genera Prevalances
+    genus.abund <- as.data.frame(abund.list$Genus)
+    # Total number of observed OTUs per person
+    tot.count <- sum(apply(genus.abund, 1, sum))
+    # Finding total abundance of each taxa
+    genus.abund$Abundance <- apply(genus.abund, 1, sum)
+    # Ordering by abundance
+    # genus.abund <- genus.abund[order(genus.abund$Abundance,decreasing = T),]
+    # Subset? to top 10 Genera
+    genus.abund <- genus.abund[,ncol(genus.abund), drop = F]
+    # Rescales the adbundances to 0-1
+    genus.abund <- genus.abund / tot.count
+    #genus.abund <- genus.abund[ order(genus.abund[,1], decreasing = T), , drop = F]
+    
+    # Subset to Genera with > .02 i.e. 2% abundance
+    genus.abund <- genus.abund[genus.abund$Abundance > .02 , , drop = F]
+    
+      # Combine data from this condition
+      a <- nrow(genus.abund)
+      A <- cbind(rep(iter,a))
+      A <- cbind(A, rownames(genus.abund), genus.abund[,1])
+      colnames(A) <- c('SampleSource', 'Genus', 'RelAbund')
+      
+      # Combine this iteration with all previous
+      genera_dat <- rbind(genera_dat, A)
+} # End loops
+genera_dat <- as.data.frame(genera_dat[-1,])
+genera_dat$RelAbund <- as.numeric(genera_dat$RelAbund)
+
+kable(genera_dat, format='html', digits=4,row.names = F) %>%
+  kable_styling(full_width = T)
+
+```
+
+
+## First, by Food Frequency Questionnaires (FFQ) (Slide 16, Step 1A: FFQ/DHQII)
+
+  1. Create matrix of gut microbiome and dietary variables from FFQ (DHQII)
+      
+      i. From "GRAMWT_G_USDA" to "Vegetablesforadjust"
+  2. Remove all taxa (genus) that have <2\% relative abundance in any sample of the gut microbiome
+  3. For each taxon identify the median by sample time point
+  4. For each measure of alpha diversity identify the median by time point
+  5. For each dietary (all listed) variable
+      
+      i. Conduct 2-tailed t-test on dietary variables above vs below the median of each taxon
+      ii. Conduct spearman correlation between dietary variables and taxon
+      iii.  Conduct 2-tailed t-test on dietary variables above vs below the median of each measure of alpha diversity
+      iv.  Conduct spearman correlation between dietary variables and each measure of alpha diversity
+  6. List all t-test results that have p<0.05 AND correlation R2 >0.5
+  7. Make heat map of the spearman correlation results meeting the above criteria colored by strength of correlation and *’d if p<0.05 (see example) 
+
+### Time point 1 analyses **WITHOUT HEI SCORES**
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+alpha.measures <- c('Observed_OTUs', 'Shannon', 'Simpson', 'InvSimpson', 'Fisher')
+taxa <- filter(genera_dat, SampleSource=='S-01')
+data <- filter(cfrip_data_biom, SampleSource=='S-01')
+
+#  SAMPLE SIZE OF DATA
+data %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+data %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+
+## Measures to cut by median:
+measures <- c(alpha.measures, paste0('Genus_',taxa$Genus))
+
+## Which metrics for these analyses:
+which(colnames(cfrip_data) == "GRAMWT_G_USDA")
+which(colnames(cfrip_data) == "VegetablesforadjustFlag")
+metrics <- colnames(cfrip_data)[237:452] ## Diet varibles only
+## Run Taxa analyses
+i<-j<-1
+md <- as.data.frame(matrix(nrow=length(measures)*length(metrics), ncol=18))
+for(met in metrics){
+  for(i in 1:length(measures)){
+    md[j,1] <- 'S-01'
+    md[j,2] <- met
+    md[j,3] <- m <- measures[i]
+    md[j,4] <- median(data[, m])  
+    ## Create dummy code for above belowmedian of taxa
+    data[,paste0('median_code_',m)] <- ifelse(data[, m] > md[j,4], 1, 0)
+    ## Set up formula
+    form <- as.formula(paste0(met,' ~ ', 'median_code_',m))
+    ## T-test
+    t.out <- t.test(form, data=data)
+    ## Compute cohen's d
+    c.d <- cohen.d(form, data=data)
+    ## Correlation (spearman)
+    sp.cor <- cor(na.omit(data[, c(m,met)]),
+                  method='spearman')
+    sp.cor <- sp.cor[1,2]
+    ## SAve results
+    md[j,5:11] <- as.numeric(unlist(t.out)[1:7])
+    md[j,12:14] <- as.numeric(unlist(c.d)[3:5])
+    md[j,15] <- sp.cor
+    md[j,16] <- sp.cor**2
+    # get sample sizes used for above vs. below
+    temp.dat <- na.omit(data[, c(m,met, paste0('median_code_',m))])
+    n.below <- nrow(temp.dat[ temp.dat[,3] == 0, ])
+    n.above <- nrow(temp.dat[ temp.dat[,3] == 1, ])
+    md[j,17] <- n.below
+    md[j,18] <- n.above
+    ## update iterator
+    j <- j + 1
+  } ## Loop around median measures
+} ## end loop around metrics of dietary factos
+# # naming the columns
+colnames(md) <- c('SampleSource', 'Diet_Factor', 'Alpha_Taxa', 'Median', 't', 'df', 'pvalue', 't-LL', 't-UL', 'Mean Below Median', 'Mean Above Median', 'Cohen d', 'd LL', 'd UL', 'rs', 'r2', 'n.below', 'n.above')
+    
+# kable(md, format='html',digits=3,row.names = F)%>%
+#   kable_styling(full_width = T)
+
+## Now for the subset of those with 
+md.s <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-01')
+kable(md.s, format='html', digits=3, row.names = F) %>%
+  kable_styling(full_width = T)
+
+
+## Full Heatmap
+dat <- filter(md, SampleSource == 'S-01')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('FFQ_heatmap_S-01.png', plot=p, width=9, heigh=30, units="in")
+
+# Subset heatmap
+dat <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-01')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('FFQ_heatmap_S-01_subset.png', plot=p, width=9, heigh=15, units="in")
+
+```
+
+<!-- ![](FFQ_heatmap_S-01.png) -->
+
+### Time point 2 analyses  **WITHOUT HEI SCORES**
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+alpha.measures <- c('Observed_OTUs', 'Shannon', 'Simpson', 'InvSimpson', 'Fisher')
+taxa <- filter(genera_dat, SampleSource=='S-02')
+data <- filter(cfrip_data_biom, SampleSource=='S-02')
+
+#  SAMPLE SIZE OF DATA
+data %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+data %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+
+## Measures to cut by median:
+#measures <- c(alpha.measures, paste0('Genus_',taxa$Genus))
+
+## Run Taxa analyses
+i<-1
+for(met in metrics){
+  for(i in 1:length(measures)){
+    md[j,1] <- 'S-02'
+    md[j,2] <- met
+    md[j,3] <- m <- measures[i]
+    md[j,4] <- median(data[, m])  
+    ## Create dummy code for above belowmedian of taxa
+    data[,paste0('median_code_',m)] <- ifelse(data[, m] > md[j,4], 1, 0)
+    ## Set up formula
+    form <- as.formula(paste0(met,' ~ ', 'median_code_',m))
+    ## T-test
+    t.out <- t.test(form, data=data)
+    ## Compute cohen's d
+    c.d <- cohen.d(form, data=data)
+    ## Correlation (spearman)
+    sp.cor <- cor(na.omit(data[, c(m,met)]),
+                  method='spearman')
+    sp.cor <- sp.cor[1,2]
+    ## SAve results
+    md[j,5:11] <- as.numeric(unlist(t.out)[1:7])
+    md[j,12:14] <- as.numeric(unlist(c.d)[3:5])
+    md[j,15] <- sp.cor
+    md[j,16] <- sp.cor**2
+    # get sample sizes used for above vs. below
+    temp.dat <- na.omit(data[, c(m,met, paste0('median_code_',m))])
+    n.below <- nrow(temp.dat[ temp.dat[,3] == 0, ])
+    n.above <- nrow(temp.dat[ temp.dat[,3] == 1, ])
+    md[j,17] <- n.below
+    md[j,18] <- n.above
+    ## update iterator
+    j <- j + 1
+  } ## Loop around median measures
+} ## end loop around metrics of dietary factos
+    
+# kable(md, format='html',digits=3,row.names = F)%>%
+#   kable_styling(full_width = T)
+
+## Now for the subset of those with 
+md.s <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-02')
+kable(md.s, format='html',digits=3,row.names = F)%>%
+  kable_styling(full_width = T)
+
+
+## Heatmap
+dat <- filter(md, SampleSource == 'S-02')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+
+p
+#ggsave('FFQ_heatmap_S-02.png', plot=p, width=9, heigh=30, units="in")
+
+# Subset heatmap
+dat <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-02')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('FFQ_heatmap_S-02_subset.png', plot=p, width=9, heigh=15, units="in")
+```
+
+<!-- ![](FFQ_heatmap_S-02.png) -->
+
+### Rerun Time point 1 **WITH HEI SCORES**
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+alpha.measures <- c('Observed_OTUs', 'Shannon', 'Simpson', 'InvSimpson', 'Fisher')
+taxa <- filter(genera_dat, SampleSource=='S-01')
+data <- filter(cfrip_data_biom, SampleSource=='S-01')
+
+#  SAMPLE SIZE OF DATA
+data %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+data %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+
+## Measures to cut by median:
+measures <- c(alpha.measures, paste0('Genus_',taxa$Genus))
+
+## Which metrics for these analyses:
+metrics <- colnames(cfrip_data)[457:470] ## HEI Variables
+
+
+## Run Taxa analyses
+i<-j<-1
+md <- as.data.frame(matrix(nrow=length(measures)*length(metrics), ncol=18))
+for(met in metrics){
+  for(i in 1:length(measures)){
+    md[j,1] <- 'S-01'
+    md[j,2] <- met
+    md[j,3] <- m <- measures[i]
+    md[j,4] <- median(data[, m])  
+    ## Create dummy code for above belowmedian of taxa
+    data[,paste0('median_code_',m)] <- ifelse(data[, m] > md[j,4], 1, 0)
+    ## Set up formula
+    form <- as.formula(paste0(met,' ~ ', 'median_code_',m))
+    ## T-test
+    t.out <- t.test(form, data=data)
+    ## Compute cohen's d
+    c.d <- cohen.d(form, data=data)
+    ## Correlation (spearman)
+    sp.cor <- cor(na.omit(data[, c(m,met)]),
+                  method='spearman')
+    sp.cor <- sp.cor[1,2]
+    ## SAve results
+    md[j,5:11] <- as.numeric(unlist(t.out)[1:7])
+    md[j,12:14] <- as.numeric(unlist(c.d)[3:5])
+    md[j,15] <- sp.cor
+    md[j,16] <- sp.cor**2
+    # get sample sizes used for above vs. below
+    temp.dat <- na.omit(data[, c(m,met, paste0('median_code_',m))])
+    n.below <- nrow(temp.dat[ temp.dat[,3] == 0, ])
+    n.above <- nrow(temp.dat[ temp.dat[,3] == 1, ])
+    md[j,17] <- n.below
+    md[j,18] <- n.above
+    ## update iterator
+    j <- j + 1
+  } ## Loop around median measures
+} ## end loop around metrics of dietary factos
+# # naming the columns
+colnames(md) <- c('SampleSource', 'Diet_Factor', 'Alpha_Taxa', 'Median', 't', 'df', 'pvalue', 't-LL', 't-UL', 'Mean Below Median', 'Mean Above Median', 'Cohen d', 'd LL', 'd UL', 'rs', 'r2', 'n.below', 'n.above')
+    
+# kable(md, format='html',digits=3,row.names = F)%>%
+#   kable_styling(full_width = T)
+
+## Now for the subset of those with 
+md.s <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-01')
+kable(md.s, format='html',digits=3,row.names = F)%>%
+  kable_styling(full_width = T)
+
+
+## Full Heatmap
+dat <- filter(md, SampleSource == 'S-01')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('FFQ_HEI_heatmap_S-01.png', plot=p, width=9, heigh=6, units="in")
+
+# Subset heatmap
+dat <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-01')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('FFQ_HEI_heatmap_S-01_subset.png', plot=p, width=9, heigh=15, units="in")
+
+```
+
+<!-- ![](FFQ_HEI_heatmap_S-01.png) -->
+
+
+
+### Rerun Time point 2 **WITH HEI SCORES**
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+alpha.measures <- c('Observed_OTUs', 'Shannon', 'Simpson', 'InvSimpson', 'Fisher')
+taxa <- filter(genera_dat, SampleSource=='S-02')
+data <- filter(cfrip_data_biom, SampleSource=='S-02')
+
+#  SAMPLE SIZE OF DATA
+data %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+data %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+## Measures to cut by median:
+#measures <- c(alpha.measures, paste0('Genus_',taxa$Genus))
+
+## Run Taxa analyses
+i<-1
+for(met in metrics){
+  for(i in 1:length(measures)){
+    md[j,1] <- 'S-02'
+    md[j,2] <- met
+    md[j,3] <- m <- measures[i]
+    md[j,4] <- median(data[, m])  
+    ## Create dummy code for above belowmedian of taxa
+    data[,paste0('median_code_',m)] <- ifelse(data[, m] > md[j,4], 1, 0)
+    ## Set up formula
+    form <- as.formula(paste0(met,' ~ ', 'median_code_',m))
+    ## T-test
+    t.out <- t.test(form, data=data)
+    ## Compute cohen's d
+    c.d <- cohen.d(form, data=data)
+    ## Correlation (spearman)
+    sp.cor <- cor(na.omit(data[, c(m,met)]),
+                  method='spearman')
+    sp.cor <- sp.cor[1,2]
+    ## SAve results
+    md[j,5:11] <- as.numeric(unlist(t.out)[1:7])
+    md[j,12:14] <- as.numeric(unlist(c.d)[3:5])
+    md[j,15] <- sp.cor
+    md[j,16] <- sp.cor**2
+    # get sample sizes used for above vs. below
+    temp.dat <- na.omit(data[, c(m,met, paste0('median_code_',m))])
+    n.below <- nrow(temp.dat[ temp.dat[,3] == 0, ])
+    n.above <- nrow(temp.dat[ temp.dat[,3] == 1, ])
+    md[j,17] <- n.below
+    md[j,18] <- n.above
+    ## update iterator
+    j <- j + 1
+  } ## Loop around median measures
+} ## end loop around metrics of dietary factos
+    
+# kable(md, format='html',digits=3,row.names = F)%>%
+#   kable_styling(full_width = T)
+
+## Now for the subset of those with 
+md.s <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-02')
+kable(md.s, format='html',digits=3,row.names = F)%>%
+  kable_styling(full_width = T)
+
+
+## Heatmap
+dat <- filter(md, SampleSource == 'S-02')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+
+p
+#ggsave('FFQ_HEI_heatmap_S-02.png', plot=p, width=9, heigh=6, units="in")
+
+# Subset heatmap
+dat <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-02')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('FFQ_HEI_heatmap_S-02_subset.png', plot=p, width=9, heigh=15, units="in")
+```
+
+<!-- ![](FFQ_HEI_heatmap_S-02.png) -->
+
+
+## Second, by ASA24 survey of food (Slide 17, Step 1B: ASA24)
+
+  1. Create matrix of gut microbiome and dietary variables matched by time point (i.e. gut sample 1 AND ASA24 RecallNo 1)
+  2. Remove all taxa (genus) that have <2\% relative abundance in any sample of the gut microbiome
+  3. For each taxon identify the median by sample time point
+  4. For each measure of alpha diversity identify the median by time point
+  5. For each dietary (all listed) variable
+
+      i. Conduct 2-tailed t-test on dietary variables above vs below the median of each taxon
+      ii. Conduct spearman correlation between dietary variables and taxon
+      iii.  Conduct 2-tailed t-test on dietary variables above vs below the median of each measure of alpha diversity
+      iv.  Conduct spearman correlation between dietary variables and each measure of alpha diversity
+
+  6. List all t-test results that have p<0.1 AND correlation R2 >0.5
+  7. Make heat map of the spearman correlation results meeting the above criteria colored by strength of correlation and satrred’d if p<0.05 (see example)
+
+### Time point 1 analyses
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+alpha.measures <- c('Observed_OTUs', 'Shannon', 'Simpson', 'InvSimpson', 'Fisher')
+taxa <- filter(genera_dat, SampleSource=='S-01')
+data <- filter(cfrip_data_biom, SampleSource=='S-01', RecallNo == 1 )
+
+#  SAMPLE SIZE OF DATA
+data %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+data %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+## Measures to cut by median:
+measures <- c(alpha.measures, paste0('Genus_',taxa$Genus))
+
+## Metrics that now include HEI Scores
+which(colnames(cfrip_data) == "Lang")
+metrics <- colnames(cfrip_data)[c(120:190)] # Diet recall only  237:452, 
+
+
+## Run Taxa analyses
+i<-j<-1
+md <- as.data.frame(matrix(nrow=length(measures)*length(metrics), ncol=18))
+for(met in metrics){
+  for(i in 1:length(measures)){
+    md[j,1] <- 'S-01-r1'
+    md[j,2] <- met
+    md[j,3] <- m <- measures[i]
+    md[j,4] <- median(data[, m])
+    ## Create dummy code for above belowmedian of taxa
+    data[,paste0('median_code_',m)] <- ifelse(data[, m] > md[j,4], 1, 0)
+    ## Set up formula
+    form <- as.formula(paste0(met,' ~ ', 'median_code_',m))
+    ## T-test
+    t.out <- tryCatch(t.test(form, data=data), error = function(e) NA)
+    ## Compute cohen's d
+    c.d <- cohen.d(form, data=data)
+    ## Correlation (spearman)
+    sp.cor <- cor(na.omit(data[, c(m,met)]),
+                  method='spearman')
+    sp.cor <- sp.cor[1,2]
+    ## SAve results
+    md[j,5:11] <- as.numeric(unlist(t.out)[1:7])
+    md[j,12:14] <- as.numeric(unlist(c.d)[3:5])
+    md[j,15] <- sp.cor
+    md[j,16] <- sp.cor**2
+    # get sample sizes used for above vs. below
+    temp.dat <- na.omit(data[, c(m,met, paste0('median_code_',m))])
+    n.below <- nrow(temp.dat[ temp.dat[,3] == 0, ])
+    n.above <- nrow(temp.dat[ temp.dat[,3] == 1, ])
+    md[j,17] <- n.below
+    md[j,18] <- n.above
+    ## update iterator
+    j <- j + 1
+  } ## Loop around median measures
+} ## end loop around metrics of dietary factos
+# # naming the columns
+colnames(md) <- c('SampleSource', 'Diet_Factor', 'Alpha_Taxa', 'Median', 't', 'df', 'pvalue', 't-LL', 't-UL', 'Mean Below Median', 'Mean Above Median', 'Cohen d', 'd LL', 'd UL', 'rs', 'r2', 'n.below', 'n.above')
+
+
+## Now for the subset of those with
+md.s <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-01-r1')
+kable(md.s, format='html',digits=3,row.names = F)%>%
+  kable_styling(full_width = T)
+
+
+## Heatmap
+dat <- filter(md, SampleSource == 'S-01-r1')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits=c(-1,1)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('ASA24_heatmap_S-01-r1.png', plot=p, width=9, heigh=30, units="in")
+
+# Subset heatmap
+dat <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-01-r1')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('ASA24_heatmap_S-01-r1_subset.png', plot=p, width=7, heigh=11, units="in")
+```
+<!--  Subset figure -->
+<!-- ![Subset of ASA24 Heatmap S-01](ASA24_heatmap_S-01-r1_subset.png) -->
+
+
+<!-- ![Full Heatmap of ASA24 S-01](ASA24_heatmap_S-01-r1.png) -->
+
+
+### Time point 2 analyses
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+
+alpha.measures <- c('Observed_OTUs', 'Shannon', 'Simpson', 'InvSimpson', 'Fisher')
+taxa <- filter(genera_dat, SampleSource=='S-02')
+data <- filter(cfrip_data_biom, SampleSource=='S-02', RecallNo == 2)
+
+#  SAMPLE SIZE OF DATA
+data %>%
+  group_by(GWG_Cat) %>%
+  summarise(n = n())
+
+data %>%
+  group_by(BMI_Class) %>%
+  summarise(n = n())
+
+## Measures to cut by median:
+measures <- c(alpha.measures, paste0('Genus_',taxa$Genus))
+
+## Run Taxa analyses
+i<-1
+for(met in metrics){
+  for(i in 1:length(measures)){
+    md[j,1] <- 'S-02-r2'
+    md[j,2] <- met
+    md[j,3] <- m <- measures[i]
+    md[j,4] <- median(data[, m])
+    ## Create dummy code for above belowmedian of taxa
+    data[,paste0('median_code_',m)] <- ifelse(data[, m] > md[j,4], 1, 0)
+    ## Set up formula
+    form <- as.formula(paste0(met,' ~ ', 'median_code_',m))
+    ## T-test
+    t.out <- tryCatch(t.test(form, data=data), error = function(e) NA)
+    ## Compute cohen's d
+    c.d <- cohen.d(form, data=data)
+    ## Correlation (spearman)
+    sp.cor <- cor(na.omit(data[, c(m,met)]),
+                  method='spearman')
+    sp.cor <- sp.cor[1,2]
+    ## SAve results
+    md[j,5:11] <- as.numeric(unlist(t.out)[1:7])
+    md[j,12:14] <- as.numeric(unlist(c.d)[3:5])
+    md[j,15] <- sp.cor
+    md[j,16] <- sp.cor**2
+    # get sample sizes used for above vs. below
+    temp.dat <- na.omit(data[, c(m,met, paste0('median_code_',m))])
+    n.below <- nrow(temp.dat[ temp.dat[,3] == 0, ])
+    n.above <- nrow(temp.dat[ temp.dat[,3] == 1, ])
+    md[j,17] <- n.below
+    md[j,18] <- n.above
+    ## update iterator
+    j <- j + 1
+  } ## Loop around median measures
+} ## end loop around metrics of dietary factos
+
+## Now for the subset of those with
+md.s <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-02-r2')
+kable(md.s, format='html',digits=3,row.names = F)%>%
+  kable_styling(full_width = T)
+
+
+## Heatmap
+dat <- filter(md, SampleSource == 'S-02-r2')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits=c(-1,1)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+
+p
+#ggsave('ASA24_heatmap_S-02-r2.png', plot=p, width=9, heigh=30, units="in")
+
+# Subset heatmap
+dat <- filter(md, r2 > r.cut, pvalue < p.cut, SampleSource == 'S-02-r2')
+dat$Alpha_Taxa <- factor(dat$Alpha_Taxa, levels=measures, ordered=T)
+p <- ggplot(dat, aes(x = Alpha_Taxa, y = Diet_Factor)) +
+  geom_tile(aes(fill = rs)) +
+  scale_fill_gradient2(name="Spearman's r", limits = c(-1,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=-.05),
+        legend.position = 'bottom')
+p
+#ggsave('ASA24_heatmap_S-02-r2_subset.png', plot=p, width=9, heigh=15, units="in")
+```
+
+<!-- Now reload the image so it can be view as the actual size created.. -->
+
+<!-- ![](ASA24_heatmap_S-02-r2.png) -->
+
+
+
+# Scatterplots of Percent Abundance by SOFAAS
+
+bacteria: Bacteroides, Finegoldia, Peptoniphilus
+
+
+```{r}
+# Calc %abundance
+cfrip_data_biom$sums <- rowSums(cfrip_data_biom[, grep('Genus', colnames(cfrip_data_biom))])
+k <- length(grep('Genus', colnames(cfrip_data_biom)))
+knames <- colnames(cfrip_data_biom)
+cfrip_data_biom <- cbind(cfrip_data_biom, 
+                         matrix(nrow=nrow(cfrip_data_biom),
+                                ncol=k))
+
+lnames <- paste0('perc_',colnames(cfrip_data_biom)[grep('Genus', colnames(cfrip_data_biom))])
+colnames(cfrip_data_biom) <- c(knames, lnames)
+
+
+for(m in 1:length(lnames)){
+  cfrip_data_biom[, lnames[m]] <- cfrip_data_biom[, knames[m+471]]/cfrip_data_biom[, 'sums']
+}# End loop
+
+data <- filter(cfrip_data_biom, SampleSource=='S-01')
+
+# SOFAAS by Bacteroides
+subdat <- data[,c('HEIX12_SOFAAS','perc_Genus_Bacteroides','GWG_Cat')]
+subdat <- na.omit(subdat)
+p1 <- ggplot(subdat, aes(x=HEIX12_SOFAAS, 
+                   y=perc_Genus_Bacteroides, 
+                   color=GWG_Cat,
+                   shape=GWG_Cat)) +
+  geom_point(aes(size=2)) +
+  lims(x=c(8,20), y=c(0,.5)) +
+  labs(x='HEI SOFAAS', y='%Abundance Bacteroides') +
+  scale_color_brewer(name='GWG Category',palette="Dark2")+
+  scale_shape_discrete(name='GWG Category') +
+  theme(legend.position="bottom") + 
+  guides(size=FALSE)
+p1
+
+
+# SOFAAS by Finegoldia
+subdat <- data[,c('HEIX12_SOFAAS','perc_Genus_Finegoldia','GWG_Cat')]
+subdat <- na.omit(subdat)
+p2 <- ggplot(subdat, aes(x=HEIX12_SOFAAS, 
+                   y=perc_Genus_Finegoldia, 
+                   color=GWG_Cat,
+                   shape=GWG_Cat)) +
+  geom_point(aes(size=2)) +
+  lims(x=c(8,20), y=c(0,.5)) +
+  labs(x='HEI SOFAAS', y='%Abundance Finegoldia') +
+  scale_color_brewer(name='GWG Category',palette="Dark2")+
+  scale_shape_discrete(name='GWG Category') +
+  theme(legend.position="bottom") + 
+  guides(size=FALSE)
+p2
+
+# SOFAAS by Peptoniphilus
+subdat <- data[,c('HEIX12_SOFAAS','perc_Genus_Peptoniphilus','GWG_Cat')]
+subdat <- na.omit(subdat)
+p3 <- ggplot(subdat, aes(x=HEIX12_SOFAAS, 
+                   y=perc_Genus_Peptoniphilus, 
+                   color=GWG_Cat,
+                   shape=GWG_Cat)) +
+  geom_point(aes(size=2)) +
+  lims(x=c(8,20), y=c(0,.5)) +
+  labs(x='HEI SOFAAS', y='%Abundance Peptoniphilus') +
+  scale_color_brewer(name='GWG Category',palette="Dark2")+
+  scale_shape_discrete(name='GWG Category') +
+  theme(legend.position="bottom") + 
+  guides(size=FALSE)
+p3
+
+
+# ggsave('scatter_sofaas_Bacteroides.pdf', plot=p1)
+# ggsave('scatter_sofaas_Finegoldia.pdf', plot=p2)
+# ggsave('scatter_sofaas_Peptoniphilus.pdf', plot=p3)
+# # 
+# ggsave('scatter_sofaas_Bacteroides.png', plot=p1)
+# ggsave('scatter_sofaas_Finegoldia.png', plot=p2)
+# ggsave('scatter_sofaas_Peptoniphilus.png', plot=p3)
+```
